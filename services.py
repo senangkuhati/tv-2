@@ -1347,7 +1347,10 @@ class StreamManager:
 
     def _spec(self, cfg: dict) -> tuple[int, int, int, int]:
         W, H, fps = self._target
-        return W, H, fps, int(cfg.get("vbr_k") or 0) or auto_vbr(H, fps)
+        vbr = int(cfg.get("vbr_k") or 0) or auto_vbr(H, fps)
+        if getattr(self, "_hls_cap", False):      # sumber lebih kecil dari target: bitrate tinggi percuma
+            vbr = min(vbr, auto_vbr(H, fps))
+        return W, H, fps, vbr
 
     def _cache_for(self, p: Path, cfg: dict) -> Path:
         W, H, fps, vbr = self._spec(cfg)
@@ -1387,13 +1390,19 @@ class StreamManager:
         self._enqueue_prep(p)
         return "live", p
 
-    def _venc(self, cfg: dict, scale: float = 1.0, preset: str = "superfast") -> list[str]:
+    def _live_preset(self) -> str:
+        """Preset x264 untuk transkode REALTIME: di server 1-2 core (Streamlit Cloud) pakai ultrafast agar
+        encoder tidak tertinggal dari waktu nyata (penyebab 'YouTube is not receiving enough video')."""
+        cores = os.cpu_count() or 1
+        return "ultrafast" if cores <= 2 and self._target[1] >= 540 else "superfast"
+
+    def _venc(self, cfg: dict, scale: float = 1.0, preset: str | None = None) -> list[str]:
         """Encoder seragam. Bitrate nyaris konstan (maxrate = bitrate, buffer kecil) -> aliran data ke
         YouTube rata. `scale` < 1 dipakai penurunan otomatis saat jaringan lambat."""
         W, H, fps, vbr = self._spec(cfg)
         vbr = max(500, int(vbr * scale))
         fc = fxm.graph(cfg.get("fx"), W, H, fps, LIVE_DIR)
-        return ["-filter_complex", fc, "-map", "[v]", *fxm.encoder_args(vbr, fps, preset)]
+        return ["-filter_complex", fc, "-map", "[v]", *fxm.encoder_args(vbr, fps, preset or self._live_preset(), cbr=preset is None)]
 
     # ---------- penyeragaman di background ----------
     def _enqueue_prep(self, p: Path):
@@ -1491,7 +1500,7 @@ class StreamManager:
                     continue
                 if not self._put(sess, sess.vq, ("mark", p.name, f"{stage_name} · {'copy' if mode == 'copy' else 'transkode langsung'}")):
                     return
-                cmd = [*(NICE if mode == "live" else []), "ffmpeg", "-hide_banner", "-loglevel", "error",
+                cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                        "-nostdin", "-fflags", "+genpts", "-i", str(src)]
                 if mode != "copy":
                     cmd += fxm.inputs(cfg.get("fx"))
@@ -1556,7 +1565,8 @@ class StreamManager:
                 T = (time.time() - t0) + 2.0
                 if not self._put(sess, sess.vq, ("mark", "HLS langsung", "sumber HLS · transkode langsung")):
                     return
-                cmd = [*NICE, "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+                # JANGAN pakai nice: encoder realtime harus dapat CPU lebih dulu daripada Streamlit/audio.
+                cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
                        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                        "-rw_timeout", "15000000", "-fflags", "+genpts",
                        *(["-re"] if cfg.get("hls_vod") else []), "-i", url,
@@ -2055,6 +2065,24 @@ class StreamManager:
                     self._target = (W, H, fps)
             else:
                 self._target = (W, H, fps)
+            self._hls_cap, hls_note = False, []
+            if hls_url:
+                self.detail = "Memeriksa resolusi & fps sumber HLS..."
+                try:
+                    import hlsprobe
+                    pr = hlsprobe.probe(hls_url)
+                except Exception:  # noqa: BLE001
+                    pr = {}
+                sv = pr.get("v") if pr.get("ok") else None
+                if sv and sv.get("h"):
+                    sh, sf = int(sv["h"]), float(sv.get("fps") or 0)
+                    H2 = max(360, sh // 2 * 2) if sh < H else H
+                    W2 = W if H2 == H else (H2 * 16 // 9) // 2 * 2
+                    fps2 = int(round(sf)) if 10 <= sf < fps - 0.5 else fps
+                    if (W2, H2, fps2) != (W, H, fps):
+                        self._target, self._hls_cap = (W2, H2, fps2), True
+                        hls_note = [f"Sumber HLS {sv['w']}x{sv['h']} @ {sf:g} fps → output disesuaikan ke "
+                                    f"{W2}x{H2} @ {fps2} fps (tanpa upscale/duplikasi frame) agar encoder ringan."]
             self.notes = [
                 *(f"Audio dilewati agar tidak terputus saat live: {p.name} ({why[:120]})"
                   for p, why in audio_skipped[:10]),
@@ -2077,6 +2105,7 @@ class StreamManager:
                 *([f"Efek aktif: {fxm.describe(cfg.get('fx'))}. Video yang sudah dibakar ke cache dikirim copy "
                    "(koneksi ringan); yang belum diproses sementara di-transkode langsung.",
                    *fxm.warnings(cfg.get("fx"))] if self._fx_on else [])]
+            self.notes += hls_note
             if vmode != "copy":
                 for p in videos:
                     if not self._cache_for(p, cfg).exists() and not self._copy_ok(p):

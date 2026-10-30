@@ -32,7 +32,7 @@ ZOOM_ANIMS = {"none": "Tanpa animasi (crop tetap saja)",
               "out_in": "Zoom in → zoom out ke ukuran crop → zoom in"}
 ANIMS = {"none": "Tetap (tanpa animasi)",
          "fade": "Fade masuk-keluar pelan",
-         "pulse": "Denyut halus (transparansi)",
+         "pulse": "Denyut pelan & hemat CPU (transparansi)",
          "blink": "Kedip",
          "float": "Melayang naik-turun",
          "slide": "Geser masuk dari kiri (berulang)"}
@@ -173,7 +173,7 @@ def describe(fx: dict | None) -> str:
 def _loop_input(path: str) -> list[str]:
     if Path(path).suffix.lower() == ".gif":
         return ["-stream_loop", "-1", "-i", path]
-    return ["-loop", "1", "-i", path]
+    return ["-loop", "1", "-framerate", "5", "-i", path]
 
 
 def inputs(fx: dict | None) -> list[str]:
@@ -247,8 +247,8 @@ def _xy(pos: str, m: int, kind: str) -> tuple[str, str]:
 
 # ───────────── animasi ─────────────
 def _alpha_expr(anim: str, var: str = "t") -> str | None:
-    return {"fade": f"(0.5-0.5*cos(2*PI*{var}/8))",
-            "pulse": f"(0.65+0.35*sin(2*PI*{var}/2.5))",
+    return {"fade": f"(0.5-0.5*cos(2*PI*{var}/12))",
+            "pulse": f"(0.65+0.35*sin(2*PI*{var}/7))",
             "blink": f"if(lt(mod({var},2),1.4),1,0)"}.get(anim)
 
 
@@ -263,6 +263,15 @@ def _dy(anim: str, H: int) -> str | None:
 def _xy_anim(x: str, y: str, anim: str, W: int, H: int) -> tuple[str, str]:
     dx, dy = _dx(anim, W), _dy(anim, H)
     return (f"({x})+({dx})" if dx else x), (f"({y})+({dy})" if dy else y)
+
+
+def _img_size(path: str) -> tuple[int, int] | None:
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return im.size
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _alpha_chain(opacity: float, anim: str) -> str:
@@ -394,11 +403,31 @@ def graph(fx: dict | None, W: int, H: int, fps: int, workdir: Path) -> str:
             # layar penuh: gambar menutupi seluruh frame (cover, dipotong di tepi), opasitas mengatur tembus pandang
             x, y = "0", "0"
             scl = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1"
+            ow = oh = 0
         else:
-            iw = max(16, int(W * im["width"]) // 2 * 2)
+            ow = iw = max(16, int(W * im["width"]) // 2 * 2)
             x, y = _xy_anim(*_xy(im["pos"], m, "image"), im["anim"], W, H)
-            scl = f"scale={iw}:-2"
-        parts.append(f"[{idx['image']}:v]{scl},{_alpha_chain(im['opacity'], im['anim'])}[ov]")
+            scl = f"scale={ow}:-2"
+        e = _alpha_expr(im["anim"], "T")
+        if im["full"]:
+            ow, oh = W, H
+        else:
+            sz = _img_size(im["path"])
+            oh = max(2, int(round(ow * sz[1] / sz[0] / 2)) * 2) if sz else 0
+            if oh:
+                scl = f"scale={ow}:{oh}"
+        if e and oh:
+            # Denyut/fade/kedip HEMAT CPU: geq hanya dihitung pada kanvas 2x2 (4 piksel), lalu diperbesar
+            # dan dikalikan ke kanal alpha gambar. (geq per-piksel pada RGBA/YUVA444 memakan banyak CPU.)
+            lv = im["opacity"]
+            parts.append(f"[{idx['image']}:v]{scl},format=rgba,split[ic][ia]")
+            parts.append("[ia]alphaextract,format=gray[iam]")
+            parts.append(f"color=c=black:s=2x2:r=5,format=gray,geq=lum='255*{lv}*{e}',"
+                         f"scale={ow}:{oh}:flags=neighbor[ipl]")
+            parts.append("[iam][ipl]blend=all_mode=multiply:shortest=1[iam2]")
+            parts.append("[ic][iam2]alphamerge[ov]")
+        else:
+            parts.append(f"[{idx['image']}:v]{scl},{_alpha_chain(im['opacity'], im['anim'])}[ov]")
         parts.append(f"[{cur}][ov]overlay=x='{x}':y='{y}':shortest=1:format=auto[oi]")
         cur = "oi"
 
@@ -455,7 +484,7 @@ def graph(fx: dict | None, W: int, H: int, fps: int, workdir: Path) -> str:
     return ";".join(parts)
 
 
-def encoder_args(vbr_k: int, fps: int, preset: str = "veryfast") -> list[str]:
+def encoder_args(vbr_k: int, fps: int, preset: str = "veryfast", cbr: bool = False) -> list[str]:
     """Pengaturan x264 ala OBS untuk siaran: bitrate nyaris konstan (maxrate = bitrate, buffer 1 detik),
     keyframe tiap 2 detik, GOP tertutup tanpa scenecut, tanpa B-frame, yuv420p dengan tag BT.709.
     Dipakai bersama oleh preview, cache efek, dan transkode live."""
@@ -464,7 +493,7 @@ def encoder_args(vbr_k: int, fps: int, preset: str = "veryfast") -> list[str]:
     return ["-c:v", "libx264", "-preset", preset, "-profile:v", "high",
             "-b:v", f"{vbr_k}k", "-maxrate", f"{vbr_k}k", "-bufsize", f"{vbr_k}k",
             "-g", g, "-keyint_min", g, "-sc_threshold", "0", "-bf", "0",
-            "-x264-params", "open-gop=0:force-cfr=1",
+            "-x264-params", "open-gop=0:force-cfr=1" + (":nal-hrd=cbr" if cbr else ""),
             "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709",
             "-color_trc", "bt709", "-color_range", "tv"]
 
